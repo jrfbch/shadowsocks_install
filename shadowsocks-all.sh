@@ -302,7 +302,12 @@ get_ipv6(){
 }
 
 get_libev_ver(){
-    libev_ver=$(wget --no-check-certificate -qO- https://api.github.com/repos/shadowsocks/shadowsocks-libev/releases/latest | grep 'tag_name' | cut -d\" -f4)
+    # NOTE: shadowsocks-libev v3.3.6+ release tarballs no longer ship a
+    # pre-generated ./configure script (and rely on git submodules that are
+    # not included in the tarball), which makes `./configure` fail with
+    # "No such file or directory". v3.3.5 is the last release that ships a
+    # complete autotools dist tarball, so we pin to it.
+    libev_ver="v3.3.5"
     [ -z "${libev_ver}" ] && echo -e "[${red}Error${plain}] Get shadowsocks-libev latest version failed" && exit 1
 }
 
@@ -345,6 +350,9 @@ download(){
         echo "${filename} [found]"
     else
         echo "${filename} not found, download now..."
+        # ensure the target directory exists (minimal images may not even
+        # ship /etc/init.d)
+        mkdir -p "$(dirname "${1}")"
         wget --no-check-certificate -c -t3 -T60 -O "${1}" "${2}"
         if [ $? -ne 0 ]; then
             echo -e "[${red}Error${plain}] Download ${filename} failed."
@@ -561,23 +569,73 @@ install_dependencies(){
         echo -e "[${green}Info${plain}] Checking the EPEL repository complete..."
 
         yum_depends=(
-            unzip gzip openssl openssl-devel gcc python python-devel python-setuptools pcre pcre-devel libtool libevent
+            unzip gzip openssl openssl-devel gcc pcre pcre-devel libtool libevent
             autoconf automake make curl curl-devel zlib-devel perl perl-devel cpio expat-devel gettext-devel
             libev-devel c-ares-devel git qrencode
         )
+        # python/python-devel/python-setuptools are only needed by
+        # Shadowsocks-Python (option 1); do not install them for other options.
+        if [ "${selected}" == '1' ]; then
+            yum_depends+=(python python-devel python-setuptools)
+        fi
         for depend in ${yum_depends[@]}; do
             error_detect_depends "yum -y install ${depend}"
         done
     elif check_sys packageManager apt; then
-        apt_depends=(
-            gettext build-essential unzip gzip python python-dev python-setuptools curl openssl libssl-dev
-            autoconf automake libtool gcc make perl cpio libpcre3 libpcre3-dev zlib1g-dev libev-dev libc-ares-dev git qrencode
-        )
-
         apt-get -y update
+        apt_depends=(
+            gettext build-essential unzip gzip wget curl openssl libssl-dev
+            autoconf automake libtool gcc make perl cpio zlib1g-dev libev-dev libc-ares-dev git qrencode
+        )
+        # python/python-dev/python-setuptools are only needed by Shadowsocks-Python
+        # (option 1). They are Python 2 packages that no longer exist on
+        # Debian 12+ / recent Ubuntu, so installing them unconditionally
+        # breaks every other install path on those systems.
+        if [ "${selected}" == '1' ]; then
+            if apt-get install -s python > /dev/null 2>&1; then
+                apt_depends+=(python python-dev python-setuptools)
+            else
+                echo -e "[${green}Info${plain}] python (Python 2) is not available, falling back to python 3"
+                apt_depends+=(python-is-python3 python-dev-is-python3 python3-setuptools)
+            fi
+        fi
+
+        # PCRE: shadowsocks-libev's configure requires PCRE1 (pcre.h + -lpcre).
+        # Debian 13+ dropped the PCRE1 packages in favour of PCRE2, so when apt
+        # no longer provides libpcre3-dev we install the last PCRE1 build
+        # (8.39-13) from the Debian pool after the depends loop below.
+        local pcre_from_pool=0
+        if apt-get install -s libpcre3-dev > /dev/null 2>&1; then
+            apt_depends+=(libpcre3 libpcre3-dev)
+        else
+            pcre_from_pool=1
+        fi
+
         for depend in ${apt_depends[@]}; do
             error_detect_depends "apt-get -y install ${depend}"
         done
+
+        if [ "${pcre_from_pool}" == '1' ] && [ ! -f /usr/include/pcre.h ]; then
+            echo -e "[${green}Info${plain}] libpcre3 (PCRE1) not available in apt, installing 8.39-13 from the Debian pool"
+            local pcre_arch
+            pcre_arch=$(dpkg --print-architecture)
+            local pcre_pool='http://deb.debian.org/debian/pool/main/p/pcre3'
+            local pcre_pkgs='libpcre3_8.39-13 libpcre16-3_8.39-13 libpcre32-3_8.39-13 libpcrecpp0v5_8.39-13 libpcre3-dev_8.39-13'
+            for pcre_pkg in ${pcre_pkgs}; do
+                if ! wget --no-check-certificate -q -t3 -T60 -O "${pcre_pkg}_${pcre_arch}.deb" "${pcre_pool}/${pcre_pkg}_${pcre_arch}.deb"; then
+                    echo -e "[${red}Error${plain}] Download ${pcre_pkg} failed."
+                    exit 1
+                fi
+            done
+            dpkg -i libpcre3_8.39-13_${pcre_arch}.deb libpcre16-3_8.39-13_${pcre_arch}.deb \
+                libpcre32-3_8.39-13_${pcre_arch}.deb libpcrecpp0v5_8.39-13_${pcre_arch}.deb \
+                libpcre3-dev_8.39-13_${pcre_arch}.deb
+            if [ $? -ne 0 ] || [ ! -f /usr/include/pcre.h ]; then
+                echo -e "[${red}Error${plain}] Failed to install libpcre3 (PCRE1) from the Debian pool."
+                exit 1
+            fi
+            rm -f libpcre*_8.39-13_${pcre_arch}.deb
+        fi
     fi
 }
 
@@ -890,7 +948,14 @@ install_shadowsocks_python(){
     fi
 
     cd ${shadowsocks_python_file} || exit
-    python setup.py install --record /usr/local/shadowsocks_python.log
+    # Prefer the explicit python interpreter; on systems without Python 2
+    # (Debian 12+) the fallback set installs python3 + python-is-python3,
+    # so either name works. Try python, then python3.
+    if command -v python > /dev/null 2>&1; then
+        python setup.py install --record /usr/local/shadowsocks_python.log
+    else
+        python3 setup.py install --record /usr/local/shadowsocks_python.log
+    fi
 
     if [ -f /usr/bin/ssserver ] || [ -f /usr/local/bin/ssserver ]; then
         chmod +x ${shadowsocks_python_init}
