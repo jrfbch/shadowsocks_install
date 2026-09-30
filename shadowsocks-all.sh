@@ -2,7 +2,7 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 #
-# Auto install Shadowsocks Server (libev and rust) with v2ray-plugin and xray-plugin
+# Auto install Shadowsocks Server (libev and rust) with v2ray-plugin, xray-plugin and simple-obfs
 #
 # Copyright (C) 2016-2026 Teddysun <i@teddysun.com>
 #
@@ -13,6 +13,7 @@ export PATH
 # https://github.com/shadowsocks/shadowsocks-rust
 # https://github.com/teddysun/v2ray-plugin
 # https://github.com/teddysun/xray-plugin
+# https://github.com/shadowsocks/simple-obfs
 #
 # Thanks:
 # @madeye     <https://github.com/madeey>
@@ -29,7 +30,7 @@ plain='\e[0m'
 
 cur_dir=$( pwd )
 software=(Shadowsocks-libev Shadowsocks-rust)
-plugins=(None v2ray-plugin xray-plugin)
+plugins=(None v2ray-plugin xray-plugin simple-obfs)
 
 shadowsocks_libev_config='/etc/shadowsocks/shadowsocks-libev-config.json'
 shadowsocks_rust_config='/etc/shadowsocks/shadowsocks-rust-config.json'
@@ -292,14 +293,38 @@ install_prepare_plugin(){
     fi
 }
 
+# SIP003 plugin name mapping:
+# - "plugin" in the server config JSON must be the server-side binary
+#   (simple-obfs ships obfs-server)
+# - the plugin= part of ss:// URLs (client import) must be the client-side
+#   binary (obfs-local), per the SIP003 spec examples
+get_plugin_binary_names(){
+    if [ "${plugin_name}" == "simple-obfs" ]; then
+        plugin_sip003_server='obfs-server'
+        plugin_sip003_client='obfs-local'
+    else
+        plugin_sip003_server="${plugin_name}"
+        plugin_sip003_client="${plugin_name}"
+    fi
+}
+
 install_prepare_plugin_options(){
-    echo "Please enter plugin options (e.g., for v2ray-plugin/xray-plugin):"
-    echo "Examples:"
-    echo "  - No TLS: server"
-    echo "  - With TLS: server;tls;host=yourdomain.com"
-    echo "  - With TLS and path: server;tls;host=yourdomain.com;path=/ws"
-    read -r -p '(Default: server):' plugin_opts
-    [ -z "${plugin_opts}" ] && plugin_opts='server'
+    if [ "${plugin_name}" == "simple-obfs" ]; then
+        echo "Please enter plugin options (for simple-obfs):"
+        echo "Examples:"
+        echo "  - HTTP obfs: obfs=http"
+        echo "  - TLS obfs: obfs=tls"
+        read -r -p '(Default: obfs=http):' plugin_opts
+        [ -z "${plugin_opts}" ] && plugin_opts='obfs=http'
+    else
+        echo "Please enter plugin options (e.g., for v2ray-plugin/xray-plugin):"
+        echo "Examples:"
+        echo "  - No TLS: server"
+        echo "  - With TLS: server;tls;host=yourdomain.com"
+        echo "  - With TLS and path: server;tls;host=yourdomain.com;path=/ws"
+        read -r -p '(Default: server):' plugin_opts
+        [ -z "${plugin_opts}" ] && plugin_opts='server'
+    fi
     echo
     echo "plugin_opts = ${plugin_opts}"
     echo
@@ -310,6 +335,7 @@ install_prepare(){
     install_prepare_port
     install_prepare_cipher
     install_prepare_plugin
+    get_plugin_binary_names
 
     echo
     echo 'Press any key to start...or Press Ctrl+C to cancel'
@@ -409,13 +435,57 @@ install_plugin(){
         apt-get install -y "${plugin_name}" > /dev/null 2>&1
     fi
     RT=$?
-    if [ ${RT} -ne 0 ]; then
+    
+    # simple-obfs: fall back to building from source when the package is
+    # not available or does not ship the obfs-server binary
+    if [ "${plugin_name}" == "simple-obfs" ] && [ ! "$(command -v obfs-server)" ]; then
+        install_simple_obfs_source
+    fi
+    
+    if [ "${plugin_name}" == "simple-obfs" ]; then
+        if [ ! "$(command -v obfs-server)" ]; then
+            echo -e "[${red}Error${plain}] ${plugin_name} installation failed."
+            exit 1
+        fi
+    elif [ ${RT:-0} -ne 0 ]; then
         echo -e "[${red}Error${plain}] ${plugin_name} installation failed."
         exit 1
     fi
 }
 
+install_simple_obfs_source(){
+    echo -e "[${green}Info${plain}] simple-obfs package not available, building from source..."
+    # build dependencies
+    if check_sys packageManager dnf; then
+        dnf install -y gcc gcc-c++ make autoconf automake libtool git \
+            libev-devel openssl-devel zlib-devel c-ares-devel mbedtls-devel > /dev/null 2>&1
+    elif check_sys packageManager apt; then
+        apt-get install -y --no-install-recommends build-essential autoconf automake libtool \
+            libev-dev libssl-dev zlib1g-dev libc-ares-dev libmbedtls-dev git > /dev/null 2>&1
+    fi
+    
+    cd "${cur_dir}" || exit
+    rm -rf simple-obfs
+    git clone https://github.com/shadowsocks/simple-obfs.git > /dev/null 2>&1
+    if [ ! -d simple-obfs ]; then
+        echo -e "[${red}Error${plain}] Failed to git clone simple-obfs."
+        return 1
+    fi
+    cd simple-obfs || return 1
+    git submodule update --init --recursive > /dev/null 2>&1
+    ./autogen.sh > /dev/null 2>&1
+    ./configure --disable-documentation > /dev/null 2>&1
+    make > /dev/null 2>&1
+    make install > /dev/null 2>&1
+    [ -f /usr/local/bin/obfs-server ] && ln -sf /usr/local/bin/obfs-server /usr/bin/obfs-server
+    cd "${cur_dir}" && rm -rf simple-obfs
+}
+
 config_shadowsocks_libev(){
+    # libev supports a multi-address "server" array even with a SIP003 plugin:
+    # it joins the addresses with "|" into SS_REMOTE_HOST and simple-obfs
+    # splits them and binds one listener per address. Keep dual-stack when
+    # IPv6 is available.
     local server_value="\"0.0.0.0\""
     if get_ipv6; then
         server_value="[\"[::0]\",\"0.0.0.0\"]"
@@ -434,7 +504,7 @@ config_shadowsocks_libev(){
     "fast_open":false,
     "nameserver":"8.8.8.8",
     "mode":"tcp_and_udp",
-    "plugin":"${plugin_name}",
+    "plugin":"${plugin_sip003_server}",
     "plugin_opts":"${plugin_opts}"
 }
 EOF
@@ -455,9 +525,16 @@ EOF
 }
 
 config_shadowsocks_rust(){
+    # rust's ssservice rejects a multi-address "server" array outright
+    # (serde ExpectedString, json parse error), plugin or not. With IPv6:
+    # - no plugin: use the single address "::" (rust's socket accepts both
+    #   v4-mapped and v6 connections by default)
+    # - with simple-obfs: fall back to "0.0.0.0", because obfs-server forces
+    #   IPV6_V6ONLY=1 for explicit addresses, so binding "::" would refuse
+    #   all IPv4 clients
     local server_value="\"0.0.0.0\""
-    if get_ipv6; then
-        server_value="[\"[::0]\",\"0.0.0.0\"]"
+    if [ "${plugin_name}" == "None" ] && get_ipv6; then
+        server_value="\"::\""
     fi
 
     mkdir -p "$(dirname ${shadowsocks_rust_config})"
@@ -472,7 +549,7 @@ config_shadowsocks_rust(){
     "method":"${shadowsockscipher}",
     "fast_open":false,
     "mode":"tcp_and_udp",
-    "plugin":"${plugin_name}",
+    "plugin":"${plugin_sip003_server}",
     "plugin_opts":"${plugin_opts}"
 }
 EOF
@@ -505,8 +582,9 @@ config_firewall(){
     fi
     if check_sys packageManager apt; then
         if ufw status &>/dev/null; then
-            ufw allow "${shadowsocksport}"/tcp
-            ufw allow "${shadowsocksport}"/udp
+            ufw allow "${shadowsocksport}"/tcp > /dev/null 2>&1
+            ufw allow "${shadowsocksport}"/udp > /dev/null 2>&1
+            echo -e "[${green}Info${plain}] Firewall port ${shadowsocksport} opened."
         else
             echo -e "[${yellow}Warning${plain}] ufw is not running, please open port ${shadowsocksport} manually if necessary."
         fi
@@ -559,7 +637,7 @@ qr_generate_libev(){
         if [ "${plugin_name}" != "None" ]; then
             # SIP003 URL format with plugin
             tmp=$(echo -n "${shadowsockscipher}:${shadowsockspwd}" | base64 -w0 | sed 's/=//g')
-            plugin_encoded=$(echo -n "${plugin_name};${plugin_opts}" | base64 -w0 | sed 's/=//g')
+            plugin_encoded=$(echo -n "${plugin_sip003_client};${plugin_opts}" | base64 -w0 | sed 's/=//g')
             qr_code="ss://${tmp}@$(get_ip):${shadowsocksport}/?plugin=${plugin_encoded}"
         else
             tmp=$(echo -n "${shadowsockscipher}:${shadowsockspwd}@$(get_ip):${shadowsocksport}" | base64 -w0)
@@ -580,7 +658,7 @@ qr_generate_rust(){
         if [ "${plugin_name}" != "None" ]; then
             # SIP003 URL format with plugin
             tmp=$(echo -n "${shadowsockscipher}:${shadowsockspwd}" | base64 -w0 | sed 's/=//g')
-            plugin_encoded=$(echo -n "${plugin_name};${plugin_opts}" | base64 -w0 | sed 's/=//g')
+            plugin_encoded=$(echo -n "${plugin_sip003_client};${plugin_opts}" | base64 -w0 | sed 's/=//g')
             qr_code="ss://${tmp}@$(get_ip):${shadowsocksport}/?plugin=${plugin_encoded}"
         else
             tmp=$(echo -n "${shadowsockscipher}:${shadowsockspwd}@$(get_ip):${shadowsocksport}" | base64 -w0)
@@ -642,10 +720,12 @@ uninstall_shadowsocks_libev(){
         systemctl stop shadowsocks-libev-server > /dev/null 2>&1
         systemctl disable shadowsocks-libev-server > /dev/null 2>&1
         if check_sys packageManager dnf; then
-            dnf remove -y shadowsocks-libev v2ray-plugin xray-plugin > /dev/null 2>&1
+            dnf remove -y shadowsocks-libev v2ray-plugin xray-plugin simple-obfs > /dev/null 2>&1
         elif check_sys packageManager apt; then
-            apt-get remove -y shadowsocks-libev v2ray-plugin xray-plugin > /dev/null 2>&1
+            apt-get remove -y shadowsocks-libev v2ray-plugin xray-plugin simple-obfs > /dev/null 2>&1
         fi
+        # simple-obfs may have been built from source (make install)
+        rm -f /usr/local/bin/obfs-server /usr/bin/obfs-server
         rm -f ${shadowsocks_libev_config}
         echo -e "[${green}Info${plain}] ${software[0]} uninstall success"
     else
@@ -663,10 +743,12 @@ uninstall_shadowsocks_rust(){
         systemctl stop shadowsocks-rust-server > /dev/null 2>&1
         systemctl disable shadowsocks-rust-server > /dev/null 2>&1
         if check_sys packageManager dnf; then
-            dnf remove -y shadowsocks-rust v2ray-plugin xray-plugin > /dev/null 2>&1
+            dnf remove -y shadowsocks-rust v2ray-plugin xray-plugin simple-obfs > /dev/null 2>&1
         elif check_sys packageManager apt; then
-            apt-get remove -y shadowsocks-rust v2ray-plugin xray-plugin > /dev/null 2>&1
+            apt-get remove -y shadowsocks-rust v2ray-plugin xray-plugin simple-obfs > /dev/null 2>&1
         fi
+        # simple-obfs may have been built from source (make install)
+        rm -f /usr/local/bin/obfs-server /usr/bin/obfs-server
         rm -f ${shadowsocks_rust_config}
         echo -e "[${green}Info${plain}] ${software[1]} uninstall success"
     else
